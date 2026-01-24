@@ -3,6 +3,9 @@ import cors from "cors";
 import axios from "axios";
 import crypto from "crypto";
 import { S3Client, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import pkg from "pg";
+
+const { Pool } = pkg;
 
 const app = express();
 app.use(cors());
@@ -14,7 +17,8 @@ const {
   S3_BUCKET,
   S3_PREFIX = "profile-pictures",
   TOOL_TOKEN,
-  CLOUDFRONT_DOMAIN // optional
+  CLOUDFRONT_DOMAIN,            // optional
+  DATABASE_URL                  // Neon
 } = process.env;
 
 if (!AWS_REGION || !S3_BUCKET || !TOOL_TOKEN) {
@@ -23,6 +27,7 @@ if (!AWS_REGION || !S3_BUCKET || !TOOL_TOKEN) {
 }
 
 const s3 = new S3Client({ region: AWS_REGION });
+const pool = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } }) : null;
 
 // auth
 function auth(req, res, next) {
@@ -91,7 +96,6 @@ async function downloadAndProcess(url) {
   const original = Buffer.from(resp.data);
   if (!original || original.length < 3000) return { ok: false, reason: "image too small" };
 
-  // try compress
   try {
     const sharp = (await import("sharp")).default;
     const processed = await sharp(original).resize({ width: 400, withoutEnlargement: true }).jpeg({ quality: 70 }).toBuffer();
@@ -105,7 +109,7 @@ async function headEtag(bucket, key) {
   try {
     const out = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
     return out.ETag ? out.ETag.replace(/"/g, "") : null;
-  } catch (e) {
+  } catch {
     return null;
   }
 }
@@ -119,7 +123,7 @@ function buildPublicUrl(key) {
   return `s3://${S3_BUCKET}/${key}`;
 }
 
-// single
+// single refresh
 app.post("/api/tools/avatar_refresh", auth, async (req, res) => {
   try {
     const username = cleanUser(req.body?.username);
@@ -148,7 +152,7 @@ app.post("/api/tools/avatar_refresh", auth, async (req, res) => {
   }
 });
 
-// batch
+// batch refresh
 app.post("/api/tools/avatar_refresh_batch", auth, async (req, res) => {
   const list = Array.isArray(req.body?.usernames) ? req.body.usernames.map(cleanUser).filter(Boolean) : [];
   if (!list.length) return res.status(400).json({ ok: false, reason: "usernames required" });
@@ -156,55 +160,37 @@ app.post("/api/tools/avatar_refresh_batch", auth, async (req, res) => {
   const results = {};
   for (const u of list) {
     try {
-      const r = await axios.post("http://localhost/internal_single", { u }); // internal call below avoids duplicate logic
-      results[u] = r.data;
-    } catch {
-      // fall back to inline
-      try {
-        const key = `${S3_PREFIX}/${u}.jpg`;
-        const avatarUrl = await fetchAvatarUrl(u);
-        if (!avatarUrl) { results[u] = { ok: false, reason: "avatar not found" }; continue; }
-        const got = await downloadAndProcess(avatarUrl);
-        if (!got.ok) { results[u] = { ok: false, reason: got.reason || "download failed" }; continue; }
-        const newMD5 = md5(got.buffer);
-        const oldETag = await headEtag(S3_BUCKET, key);
-        let updated = true;
-        if (oldETag && oldETag === newMD5) {
-          updated = false;
-        } else {
-          await putS3(S3_BUCKET, key, got.buffer, got.contentType);
-        }
-        results[u] = { ok: true, s3Key: key, url: buildPublicUrl(key), updated };
-      } catch (e) {
-        results[u] = { ok: false, reason: e.message || "error" };
+      const key = `${S3_PREFIX}/${u}.jpg`;
+      const avatarUrl = await fetchAvatarUrl(u);
+      if (!avatarUrl) { results[u] = { ok: false, reason: "avatar not found" }; continue; }
+      const got = await downloadAndProcess(avatarUrl);
+      if (!got.ok) { results[u] = { ok: false, reason: got.reason || "download failed" }; continue; }
+      const newMD5 = md5(got.buffer);
+      const oldETag = await headEtag(S3_BUCKET, key);
+      let updated = true;
+      if (oldETag && oldETag === newMD5) {
+        updated = false;
+      } else {
+        await putS3(S3_BUCKET, key, got.buffer, got.contentType);
       }
+      results[u] = { ok: true, s3Key: key, url: buildPublicUrl(key), updated };
+    } catch (e) {
+      results[u] = { ok: false, reason: e.message || "error" };
     }
     await new Promise(r => setTimeout(r, 250));
   }
   return res.json({ ok: true, results });
 });
 
-// small internal helper so batch can reuse logic without auth
-app.post("/internal_single", async (req, res) => {
+// user list from Neon
+app.get("/api/tools/user_list", auth, async (req, res) => {
+  if (!pool) return res.status(500).json({ ok: false, reason: "database not configured" });
   try {
-    const username = cleanUser(req.body?.u);
-    if (!username) return res.status(400).json({ ok: false });
-    const key = `${S3_PREFIX}/${username}.jpg`;
-    const avatarUrl = await fetchAvatarUrl(username);
-    if (!avatarUrl) return res.json({ ok: false, reason: "avatar not found" });
-    const got = await downloadAndProcess(avatarUrl);
-    if (!got.ok) return res.json({ ok: false, reason: got.reason || "download failed" });
-    const newMD5 = md5(got.buffer);
-    const oldETag = await headEtag(S3_BUCKET, key);
-    let updated = true;
-    if (oldETag && oldETag === newMD5) {
-      updated = false;
-    } else {
-      await putS3(S3_BUCKET, key, got.buffer, got.contentType);
-    }
-    return res.json({ ok: true, s3Key: key, url: buildPublicUrl(key), updated });
+    const { rows } = await pool.query(`select distinct username from users where username is not null and username <> '' order by 1`);
+    const list = rows.map(r => cleanUser(r.username)).filter(Boolean);
+    return res.json(list); // array for Scriptable
   } catch (e) {
-    return res.json({ ok: false, reason: e.message || "error" });
+    return res.status(500).json({ ok: false, reason: e.message || "db error" });
   }
 });
 
