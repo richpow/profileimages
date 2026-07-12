@@ -32,6 +32,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
+app.use((req, res, next) => {
+  console.log(`${req.method} ${req.originalUrl}`);
+  next();
+});
+
 /* ---------- auth ---------- */
 function auth(req, res, next) {
   const token = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
