@@ -10,9 +10,8 @@ import {
 } from "@aws-sdk/client-s3";
 import pg from "pg";
 
-// Latest dated roster in EACH region.
-// UKI and MENA do not have to share the same latest date.
-// The authoritative Neon columns are DATE.
+// Use each region's OWN latest dated roster,
+// then deduplicate usernames across both regions.
 export const LATEST_ROSTER_SQL = `
 WITH roster AS (
   SELECT lower(regexp_replace(trim("Creator's username"), '^@', '')) AS username,
@@ -81,8 +80,7 @@ function avatarFromUser(user, username) {
 }
 
 export function extractAvatar(html, username) {
-  // Only accept the requested creator's photo.
-  // Do not accidentally use another avatar elsewhere on the page.
+  // Only accept the requested creator's real photo.
   for (const id of [
     "__UNIVERSAL_DATA_FOR_REHYDRATION__",
     "SIGI_STATE",
@@ -265,6 +263,11 @@ export function createAvatarTool({
   const automatic = env.AUTO_REFRESH !== "false";
 
   const jobs = new Map();
+
+  // Internal queue metadata is deliberately excluded
+  // from the public job-status JSON.
+  const jobWork = new WeakMap();
+
   const failedUsers = new Set();
   const seenRoster = new Set();
   const inFlight = new Map();
@@ -290,6 +293,9 @@ export function createAvatarTool({
       "Access-Control-Allow-Methods",
       "GET, POST, OPTIONS",
     );
+
+    // Do not cache old progress counters or start acknowledgments.
+    res.setHeader("Cache-Control", "no-store");
 
     if (req.method === "OPTIONS") {
       return res.sendStatus(204);
@@ -378,8 +384,7 @@ export function createAvatarTool({
           return trustedAvatarUrl(avatar);
         }
       } catch {
-        // Try the independent mobile request
-        // even if the desktop request failed.
+        // Independently try mobile even when desktop fails.
       }
     }
 
@@ -416,7 +421,7 @@ export function createAvatarTool({
     }
 
     // Decode and validate BEFORE changing S3.
-    // Never upload invalid/raw bytes as a fake JPEG.
+    // Never replace a real photo with invalid bytes or a placeholder.
     const buffer = await encode(
       Buffer.from(response.data),
       {
@@ -462,7 +467,7 @@ export function createAvatarTool({
       hash;
 
     // Older objects may not have SHA-256 metadata.
-    // A simple MD5 ETag can still identify unchanged bytes.
+    // A simple MD5 ETag can identify unchanged bytes.
     if (
       updated &&
       existing?.ETag?.replaceAll('"', "") ===
@@ -591,7 +596,44 @@ export function createAvatarTool({
   }
 
   function launchJob(usernames, source) {
+    const names = [
+      ...new Set(usernames.map(cleanUser)),
+    ];
+
     if (activeJob) {
+      // A manual full refresh MUST NOT inherit only
+      // an 81-person retry or late-arrival list.
+      //
+      // Expand the active job to cover every current
+      // roster username without repeating anyone
+      // already queued, running or completed.
+      const work = jobWork.get(activeJob);
+      let added = 0;
+
+      for (const username of names) {
+        if (work.usernames.has(username)) {
+          continue;
+        }
+
+        work.usernames.add(username);
+        work.queue.push(username);
+        added++;
+      }
+
+      activeJob.total = work.usernames.size;
+
+      if (
+        source === "latest-rosters" &&
+        activeJob.source ===
+          "late-arrivals-or-retry"
+      ) {
+        activeJob.source = source;
+      }
+
+      log(
+        `Avatar job expanded: ${added} added, ${activeJob.total} total`,
+      );
+
       return {
         job: activeJob,
         coalesced: true,
@@ -601,7 +643,7 @@ export function createAvatarTool({
     const job = {
       job_id: randomUUID(),
       source,
-      total: usernames.length,
+      total: names.length,
       completed: 0,
       updated: 0,
       unchanged: 0,
@@ -610,6 +652,13 @@ export function createAvatarTool({
       finishedAt: null,
       failures: [],
     };
+
+    const queue = [...names];
+
+    jobWork.set(job, {
+      queue,
+      usernames: new Set(names),
+    });
 
     jobs.set(job.job_id, job);
 
@@ -620,47 +669,55 @@ export function createAvatarTool({
     }
 
     activeJob = job;
-    const queue = [...usernames];
 
     job.promise = (async () => {
-      await Promise.all(
-        Array.from(
-          { length: concurrency },
-          async () => {
-            while (
-              queue.length &&
-              !stopping
-            ) {
-              const result =
-                await refreshOne(
-                  queue.shift(),
-                );
-
-              // Completed includes failures.
-              job.completed++;
-
-              if (!result.ok) {
-                job.failed++;
-                job.failures.push(
-                  result.username,
-                );
-              } else if (
-                result.updated
+      // Recheck after workers settle. A manual request
+      // may append the full roster while a smaller
+      // background batch is finishing.
+      do {
+        await Promise.all(
+          Array.from(
+            { length: concurrency },
+            async () => {
+              while (
+                queue.length &&
+                !stopping
               ) {
-                job.updated++;
-              } else {
-                job.unchanged++;
+                const result =
+                  await refreshOne(
+                    queue.shift(),
+                  );
+
+                // Completed means attempted.
+                // Updated, unchanged and failed remain separate.
+                job.completed++;
+
+                if (!result.ok) {
+                  job.failed++;
+                  job.failures.push(
+                    result.username,
+                  );
+                } else if (
+                  result.updated
+                ) {
+                  job.updated++;
+                } else {
+                  job.unchanged++;
+                }
               }
-            }
-          },
-        ),
+            },
+          ),
+        );
+      } while (
+        queue.length &&
+        !stopping
       );
 
       job.finishedAt = now();
       activeJob = null;
 
       log(
-        `Avatar job finished: ${job.completed}/${job.total}, ${job.updated} updated, ${job.failed} failed`,
+        `Avatar job finished: ${job.completed}/${job.total}, ${job.updated} updated, ${job.unchanged} unchanged, ${job.failed} failed`,
       );
     })();
 
@@ -671,21 +728,26 @@ export function createAvatarTool({
   }
 
   async function startLatestJob() {
-    if (activeJob) {
-      return {
-        job: activeJob,
-        coalesced: true,
-      };
+    if (stopping) {
+      throw new Error("Service is stopping");
     }
 
-    // Always read both latest dates again.
+    // IMPORTANT:
+    // Always read the FULL latest UKI + MENA roster
+    // BEFORE considering an existing active job.
+    //
+    // Do not return a small automatic retry job
+    // without first adding the rest of the roster.
     const current = await roster();
 
-    if (activeJob) {
-      return {
-        job: activeJob,
-        coalesced: true,
-      };
+    if (stopping) {
+      throw new Error("Service is stopping");
+    }
+
+    if (!current.usernames.length) {
+      throw new Error(
+        "Latest regional rosters are empty",
+      );
     }
 
     latestSignature =
@@ -715,6 +777,7 @@ export function createAvatarTool({
 
     try {
       const current = await roster();
+
       const eligible = new Set(
         current.usernames,
       );
@@ -725,9 +788,8 @@ export function createAvatarTool({
         }
       }
 
-      if (activeJob) {
-        // Next poll reads current data
-        // after this run finishes.
+      if (activeJob || stopping) {
+        // Recheck on the next poll after active work finishes.
         return;
       }
 
@@ -742,8 +804,9 @@ export function createAvatarTool({
             !seenRoster.has(username),
         );
 
-      // New dates trigger a full pass.
-      // Same-date late arrivals only refresh new creators.
+      // New regional dates trigger a full pass.
+      // Same-date arrivals/retries remain incremental
+      // unless a manual full refresh expands them.
       const dateChanged =
         current.periodSignature !==
         latestSignature;
@@ -969,7 +1032,8 @@ export function createAvatarTool({
     startScheduler() {
       if (
         !automatic ||
-        timer
+        timer ||
+        stopping
       ) {
         return;
       }
